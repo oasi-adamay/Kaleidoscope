@@ -1,4 +1,4 @@
-﻿//#define _JIT_AS_INTERPRETER
+﻿#define _JIT_AS_INTERPRETER
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/Passes.h"
@@ -467,19 +467,23 @@ static std::unique_ptr<Module> TheModule;	//LLVM IRがコードを収容する�
 static IRBuilder<> Builder(getGlobalContext());	//LLVM命令を生成するのを簡単にするためのヘルパオブジェクト
 static std::map<std::string, Value *> NamedValues;	//現在のスコープにおける、名前とLLVM Value
 static std::unique_ptr<legacy::FunctionPassManager> TheFPM;	//関数パスマネージャ
-#ifdef _JIT_AS_INTERPRETER
-//static std::unique_ptr<ExecutionEngine> TheJIT;
-static ExecutionEngine* TheJIT;
-#else
+#ifndef _JIT_AS_INTERPRETER
 static std::unique_ptr<KaleidoscopeJIT> TheJIT;
-#endif
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+#endif
 
 Value *ErrorV(const char *Str) {
   Error(Str);
   return nullptr;
 }
 
+Function *ErrorF(const char *Str) {
+	Error(Str);
+	return nullptr;
+}
+
+
+#ifndef _JIT_AS_INTERPRETER
 Function *getFunction(std::string Name) {
   // First, see if the function has already been added to the current module.
   if (auto *F = TheModule->getFunction(Name))
@@ -494,6 +498,7 @@ Function *getFunction(std::string Name) {
   // If no existing prototype exists, return null.
   return nullptr;
 }
+#endif
 
 Value *NumberExprAST::codegen() {
   //LLVM IRでは、定数は、すべてお互いにユニークであり共有される
@@ -538,7 +543,8 @@ Value *BinaryExprAST::codegen() {
 
 Value *CallExprAST::codegen() {
   // Look up the name in the global module table.
-  Function *CalleeF = getFunction(Callee);
+  // // グローバルモジュールテーブルから名前を探す。
+  Function *CalleeF = TheModule->getFunction(Callee);
   if (!CalleeF)
     return ErrorV("Unknown function referenced");
 
@@ -573,6 +579,33 @@ Function *PrototypeAST::codegen() {
   Function *F =
       Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
 
+  //-----------------------
+  // 以下のケースを除き、関数の２重定義の禁止
+  // - プロトタイプが合致する限り,externの宣言を複数回可能
+  // - extern宣言した後、後でその本体を定義する事を可能
+  //
+  // Fの名前がNameと一致しない場合, Nameが表す文字列で名付けられた何かがすでに存在しているということになる。
+  // 関数本体を持つものに関しては、再定義や再extern（reextern）は許可しない。
+  if (F->getName() != Name) {
+	  // ひとつだけ存在してる状態を保つために、消去する。
+	  F->eraseFromParent();
+	
+	  F = TheModule->getFunction(Name);
+	  // すでにFが本体を持つなら受け入れない。
+	  if (!F->empty()) {
+		  ErrorF("redefinition of function");
+		  return 0;
+	  }
+
+	  // もしFが受け取る引数の数が違うなら受け入れない。
+	  if (F->arg_size() != Args.size()) {
+		  ErrorF("redefinition of function with different # args");
+		  return 0;
+	  }
+  }
+
+
+
   // Set names for all arguments.
   // 全ての引数について名前をセットする。
   unsigned Idx = 0;
@@ -584,11 +617,30 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
+#ifndef _JIT_AS_INTERPRETER
   // Transfer ownership of the prototype to the FunctionProtos map, but keep a
   // reference to it for use below.
   auto &P = *Proto;
   FunctionProtos[Proto->getName()] = std::move(Proto);
   Function *TheFunction = getFunction(P.getName());
+#else
+  // First, check for an existing function from a previous 'extern' declaration.
+  // 最初に、以前に、extern宣言された関数が存在するかチェックする。
+  Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+  //  __anon_expr関数が存在すれば、削除する。
+  if (Proto->getName() == "__anon_expr" && TheFunction) {
+	  TheFunction->eraseFromParent();
+	  TheFunction = nullptr;
+  }
+
+
+  //その関数のプロトタイプ（Proto）のコード生成を行い、戻り値をチェックする
+  if (!TheFunction)
+    TheFunction = Proto->codegen();
+#endif
+
+  //プロトタイプのコード生成によって、この後の処理に用いるLLVM関数オブジェクトの存在が確実なものとなる。
   if (!TheFunction)
     return nullptr;
 
@@ -616,7 +668,7 @@ Function *FunctionAST::codegen() {
 
     // Run the optimizer on the function.
 	// 関数を最適化する。
-    TheFPM->run(*TheFunction);
+    //TheFPM->run(*TheFunction);
 
     return TheFunction;
   }
@@ -662,8 +714,10 @@ static void HandleDefinition() {
     if (auto *FnIR = FnAST->codegen()) {
       fprintf(stderr, "Read function definition:");
       FnIR->dump();
+#ifndef _JIT_AS_INTERPRETER
       TheJIT->addModule(std::move(TheModule));
       InitializeModuleAndPassManager();
+#endif
     }
   } else {
     // Skip token for error recovery.
@@ -676,7 +730,9 @@ static void HandleExtern() {
     if (auto *FnIR = ProtoAST->codegen()) {
       fprintf(stderr, "Read extern: ");
       FnIR->dump();
+#ifndef _JIT_AS_INTERPRETER
       FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
+#endif
     }
   } else {
     // Skip token for error recovery.
@@ -689,33 +745,17 @@ static void HandleTopLevelExpression() {
   if (auto FnAST = ParseTopLevelExpr()) {
     if (auto F = FnAST->codegen()) {
 #ifdef _JIT_AS_INTERPRETER
+		fprintf(stderr, "Read top-level expression:");
 		F->dump();
-		TheModule->dump();
 
-		// JIT the module containing the anonymous expression, keeping a handle so
-		// we can free it later.
-		auto H = TheModule.get();
-		TheJIT->addModule(std::move(TheModule));
-		InitializeModuleAndPassManager();
-
+		// Now we create the JIT.
+		//ExecutionEngine *EE = EngineBuilder(std::move(TheModule)).create();
+		ExecutionEngine *EE = EngineBuilder(std::unique_ptr<llvm::Module>(TheModule.get())).create();
+		
+		// Call the `__anon_expr` function with no arguments:
 		std::vector<llvm::GenericValue> args;
-		GenericValue  ret = TheJIT->runFunction(F, args);
+		GenericValue  ret = EE->runFunction(F, args);
 		fprintf(stderr, "Evaluated to %f\n", ret.DoubleVal);
-
-		// Delete the anonymous expression module from the JIT.
-		TheJIT->removeModule(H);
-
-
-	//	// Now we create the JIT.
-	//	//ExecutionEngine *EE = EngineBuilder(std::move(TheModule)).create();
-	//	ExecutionEngine *EE = EngineBuilder(std::unique_ptr<llvm::Module>(TheModule.get())).create();
-	//	
-
-	//	// Call the `__anon_expr` function with no arguments:
-	//	std::vector<llvm::GenericValue> args;
-	//	GenericValue  ret = EE->runFunction(F, args);
-	////		GenericValue  ret = TheJIT->runFunction(F, args);
-	//	fprintf(stderr, "Evaluated to %f\n", ret.DoubleVal);
 
 #else
       // JIT the module containing the anonymous expression, keeping a handle so
@@ -804,14 +844,8 @@ int main() {
 
 #ifndef _JIT_AS_INTERPRETER
   TheJIT = llvm::make_unique<KaleidoscopeJIT>();
-  InitializeModuleAndPassManager();
-
-#else
-  InitializeModuleAndPassManager();
-  // Now we create the JIT.
-//  TheJIT = llvm::make_unique<ExecutionEngine>(EngineBuilder(std::unique_ptr<llvm::Module>(TheModule.get())).create());
-  TheJIT = EngineBuilder(std::unique_ptr<llvm::Module>(TheModule.get())).create();
 #endif
+  InitializeModuleAndPassManager();
 
 
   // Run the main "interpreter loop" now.

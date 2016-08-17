@@ -745,7 +745,7 @@ static void HandleTopLevelExpression() {
 // top ::= definition | external | expression | ';'
 static void MainLoop() {
   while (1) {
-    fprintf(stderr, "ready> ");
+    //fprintf(stderr, "ready> ");
     switch (CurTok) {
     case tok_eof:
       return;
@@ -762,6 +762,7 @@ static void MainLoop() {
       HandleTopLevelExpression();
       break;
     }
+	fprintf(stderr, "ready> ");
   }
 }
 
